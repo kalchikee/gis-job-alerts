@@ -363,6 +363,294 @@ def scrape_governmentjobs() -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# ZipRecruiter  (public JSON search endpoint)
+# ---------------------------------------------------------------------------
+
+ZR_QUERIES = [
+    "GIS analyst",
+    "GIS specialist",
+    "geospatial analyst",
+    "spatial analyst",
+    "GIS technician",
+    "GIS developer",
+    "remote sensing analyst",
+    "cartographer",
+]
+
+ZR_LOCATIONS = ["Florida", "Texas", "North Carolina"]
+
+
+def scrape_ziprecruiter() -> list[dict]:
+    jobs = []
+    # ZipRecruiter exposes a public search JSON endpoint used by their own UI
+    base = "https://www.ziprecruiter.com/jobs-search"
+
+    for query in ZR_QUERIES:
+        for location in ZR_LOCATIONS:
+            url = base
+            params = {
+                "search": query,
+                "location": location,
+                "days": 3,
+                "radius": 100,
+            }
+            logger.info("ZipRecruiter: '%s' in %s", query, location)
+
+            # First try the JSON API endpoint
+            json_url = "https://api.ziprecruiter.com/jobs/v1"
+            json_params = {
+                "search": query,
+                "location": location,
+                "radius_miles": 100,
+                "days_ago": 3,
+                "jobs_per_page": 20,
+                "page": 1,
+            }
+            resp = safe_get(json_url, params=json_params)
+            if resp and resp.headers.get("Content-Type", "").startswith("application/json"):
+                try:
+                    data = resp.json()
+                    for item in data.get("jobs", []):
+                        title = item.get("name", "")
+                        company = item.get("hiring_company", {}).get("name", "")
+                        loc = item.get("location", location)
+                        href = item.get("url", "")
+                        desc = item.get("snippet", "")
+                        posted = item.get("posted_time", datetime.now(timezone.utc).isoformat())
+
+                        if not title:
+                            continue
+                        job = {
+                            "id": make_job_id(title, company, loc),
+                            "title": title,
+                            "company": company,
+                            "location": loc,
+                            "url": href,
+                            "description": desc[:2000],
+                            "date_posted": posted,
+                            "source": "ZipRecruiter",
+                        }
+                        jobs.append(job)
+                    time.sleep(REQUEST_DELAY)
+                    continue
+                except Exception:
+                    pass  # fall through to HTML scrape
+
+            # Fallback: scrape HTML search results page
+            resp = safe_get(url, params=params)
+            if not resp:
+                time.sleep(REQUEST_DELAY)
+                continue
+
+            soup = BeautifulSoup(resp.text, "lxml")
+
+            # ZipRecruiter job cards live in <article> tags or divs with data-job-id
+            cards = soup.find_all("article", class_=lambda c: c and "job_result" in (c or ""))
+            if not cards:
+                cards = soup.find_all("div", attrs={"data-job-id": True})
+            if not cards:
+                # Generic fallback: any article tag
+                cards = soup.find_all("article")
+
+            for card in cards:
+                try:
+                    title_tag = (
+                        card.find("h2")
+                        or card.find("h3")
+                        or card.find(class_=lambda c: c and "job_title" in (c or ""))
+                    )
+                    company_tag = card.find(class_=lambda c: c and ("company" in (c or "") or "employer" in (c or "")))
+                    location_tag = card.find(class_=lambda c: c and "location" in (c or ""))
+                    link_tag = card.find("a", href=True)
+
+                    title = title_tag.get_text(strip=True) if title_tag else ""
+                    company = company_tag.get_text(strip=True) if company_tag else ""
+                    loc = location_tag.get_text(strip=True) if location_tag else location
+                    href = link_tag["href"] if link_tag else ""
+                    if href and not href.startswith("http"):
+                        href = "https://www.ziprecruiter.com" + href
+
+                    if not title:
+                        continue
+
+                    job = {
+                        "id": make_job_id(title, company, loc),
+                        "title": title,
+                        "company": company,
+                        "location": loc,
+                        "url": href,
+                        "description": card.get_text(separator=" ", strip=True)[:2000],
+                        "date_posted": datetime.now(timezone.utc).isoformat(),
+                        "source": "ZipRecruiter",
+                    }
+                    jobs.append(job)
+                except Exception as e:
+                    logger.debug("ZipRecruiter card parse error: %s", e)
+
+            time.sleep(REQUEST_DELAY)
+
+    logger.info("ZipRecruiter: collected %d raw listings", len(jobs))
+    return jobs
+
+
+# ---------------------------------------------------------------------------
+# Glassdoor  (public HTML search — aggressive bot protection, best-effort)
+# ---------------------------------------------------------------------------
+
+GD_QUERIES = [
+    "GIS analyst",
+    "geospatial analyst",
+    "spatial analyst",
+    "GIS specialist",
+    "GIS technician",
+]
+
+GD_LOCATIONS = [
+    ("Florida", "1154990"),      # Glassdoor location ID for Florida
+    ("Texas", "1347615"),        # Texas
+    ("North Carolina", "1115940"),  # North Carolina
+]
+
+
+def scrape_glassdoor() -> list[dict]:
+    jobs = []
+
+    # Glassdoor's public job search — returns HTML with embedded JSON in some cases
+    # Use a session with realistic headers to reduce bot detection
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Referer": "https://www.glassdoor.com/",
+        "DNT": "1",
+    })
+
+    for query in GD_QUERIES:
+        for state_name, loc_id in GD_LOCATIONS:
+            # URL format that Glassdoor's own search bar uses
+            keyword_slug = query.replace(" ", "-")
+            url = (
+                f"https://www.glassdoor.com/Job/{state_name.lower().replace(' ', '-')}-"
+                f"{keyword_slug}-jobs-SRCH_IL.0,{len(state_name)}_IS{loc_id}_KO"
+                f"{len(state_name) + 1},{len(state_name) + 1 + len(query)}.htm"
+            )
+
+            # Simpler fallback URL that's more reliably parsed
+            url = (
+                "https://www.glassdoor.com/Job/jobs.htm"
+                f"?sc.keyword={requests.utils.quote(query)}"
+                f"&locT=S&locId={loc_id}"
+                f"&fromAge=3"
+            )
+
+            logger.info("Glassdoor: '%s' in %s", query, state_name)
+            try:
+                resp = session.get(url, timeout=15)
+                resp.raise_for_status()
+            except Exception as e:
+                logger.warning("Glassdoor request failed (%s, %s): %s", query, state_name, e)
+                time.sleep(REQUEST_DELAY)
+                continue
+
+            soup = BeautifulSoup(resp.text, "lxml")
+
+            # Glassdoor embeds job data as JSON in a <script> tag
+            import json as _json
+            found_from_json = False
+            for script in soup.find_all("script", type="application/ld+json"):
+                try:
+                    data = _json.loads(script.string or "")
+                    # JobPosting schema
+                    if isinstance(data, list):
+                        items = data
+                    elif data.get("@type") == "ItemList":
+                        items = [e.get("item", e) for e in data.get("itemListElement", [])]
+                    else:
+                        items = [data]
+
+                    for item in items:
+                        if item.get("@type") != "JobPosting":
+                            continue
+                        title = item.get("title", "")
+                        company = item.get("hiringOrganization", {}).get("name", "")
+                        loc_obj = item.get("jobLocation", {})
+                        if isinstance(loc_obj, list):
+                            loc_obj = loc_obj[0] if loc_obj else {}
+                        addr = loc_obj.get("address", {})
+                        loc = f"{addr.get('addressLocality', '')}, {addr.get('addressRegion', state_name)}".strip(", ")
+                        href = item.get("url", "")
+                        desc = BeautifulSoup(item.get("description", ""), "html.parser").get_text()[:2000]
+                        posted = item.get("datePosted", datetime.now(timezone.utc).isoformat())
+
+                        if not title:
+                            continue
+                        job = {
+                            "id": make_job_id(title, company, loc),
+                            "title": title,
+                            "company": company,
+                            "location": loc,
+                            "url": href,
+                            "description": desc,
+                            "date_posted": posted,
+                            "source": "Glassdoor",
+                        }
+                        jobs.append(job)
+                        found_from_json = True
+                except Exception:
+                    continue
+
+            if not found_from_json:
+                # Fallback: parse job listing cards from HTML
+                cards = soup.find_all("li", class_=lambda c: c and "JobsList_jobListItem" in (c or ""))
+                if not cards:
+                    cards = soup.find_all("div", attrs={"data-test": "jobListing"})
+                if not cards:
+                    cards = soup.find_all("li", class_=lambda c: c and "react-job-listing" in (c or ""))
+
+                for card in cards:
+                    try:
+                        title_tag = card.find(attrs={"data-test": "job-title"}) or card.find("a", class_=lambda c: c and "JobCard_seoLink" in (c or ""))
+                        company_tag = card.find(attrs={"data-test": "employer-name"}) or card.find(class_=lambda c: c and "employer-name" in (c or ""))
+                        location_tag = card.find(attrs={"data-test": "emp-location"}) or card.find(class_=lambda c: c and "location" in (c or ""))
+                        link_tag = card.find("a", href=True)
+
+                        title = title_tag.get_text(strip=True) if title_tag else ""
+                        company = company_tag.get_text(strip=True) if company_tag else ""
+                        loc = location_tag.get_text(strip=True) if location_tag else state_name
+                        href = link_tag["href"] if link_tag else ""
+                        if href and not href.startswith("http"):
+                            href = "https://www.glassdoor.com" + href
+
+                        if not title:
+                            continue
+
+                        job = {
+                            "id": make_job_id(title, company, loc),
+                            "title": title,
+                            "company": company,
+                            "location": loc,
+                            "url": href,
+                            "description": card.get_text(separator=" ", strip=True)[:2000],
+                            "date_posted": datetime.now(timezone.utc).isoformat(),
+                            "source": "Glassdoor",
+                        }
+                        jobs.append(job)
+                    except Exception as e:
+                        logger.debug("Glassdoor card parse error: %s", e)
+
+            time.sleep(REQUEST_DELAY)
+
+    logger.info("Glassdoor: collected %d raw listings", len(jobs))
+    return jobs
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -380,6 +668,8 @@ def run_all_scrapers(usajobs_api_key: str = "", usajobs_email: str = "") -> list
         ("GISJobs.com", scrape_gisjobs, {}),
         ("LinkedIn", scrape_linkedin, {}),
         ("GovernmentJobs", scrape_governmentjobs, {}),
+        ("ZipRecruiter", scrape_ziprecruiter, {}),
+        ("Glassdoor", scrape_glassdoor, {}),
     ]
 
     for name, func, kwargs in sources:
